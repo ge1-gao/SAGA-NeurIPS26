@@ -54,14 +54,14 @@ data/points/flame_steak/
 
 ## optimization
 
-**Step 1 — STG warm-up** (~4k steps). Used only to propose anchor candidates:
+**step 1 — STG warm-up** (~4k steps). Used only to propose anchor candidates:
 
 ```bash
 python -m saga.train --model stg --scene-dir $SCENE --points-dir data/points/flame_steak \
     --out-dir results/stg_warm --max-steps 4000 --refine-stop 3500 --reset-every 100000 --eval-every 100000
 ```
 
-**Step 2 — SAGA** (30k steps):
+**step 2 — SAGA** (30k steps):
 
 ```bash
 python -m saga.train --model saga --scene-dir $SCENE --points-dir data/points/flame_steak \
@@ -101,7 +101,7 @@ To run the tests:
 python -m pytest -q tests
 ```
 
-## Code structure
+## code structure
 
 ```
 saga/
@@ -127,11 +127,11 @@ saga/
 tests/                    # unit tests
 ```
 
-## Acknowledgements
+## acknowledgements
 
 The STG components are ported from [GSCodec Studio](https://github.com/JasonLSC/GSCodec_Studio). Rendering uses [gsplat](https://github.com/nerfstudio-project/gsplat). 
 
-## Citation
+## citation
 
 ```bibtex
 @inproceedings{saga2026,
