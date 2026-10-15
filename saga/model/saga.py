@@ -145,7 +145,7 @@ class SAGAModel(nn.Module):
         out = self.f_fine(torch.cat([f_c, posenc(self.fine_offset, cfg.pe_off)], -1))
         f_f, raw = out[:, :cfg.feat_dim], out[:, cfg.feat_dim:]
         l_xyz = self.fine_spacing * torch.exp(raw[:, :3].clamp(-4, 2))
-        l_tau = lc[par, 3:4] * torch.sigmoid(raw[:, 3:4])
+        l_tau = lc[par, 3:4] * torch.sigmoid(raw[:, 3:4].clamp(min=-10))    # fix the bug to avoid overflow / gradient explosion
         return u_f, torch.cat([l_xyz, l_tau], 1), f_f
 
     def decode(self) -> dict:
