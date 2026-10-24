@@ -3,7 +3,8 @@
   <out>/png -> <scene>/png, <out>/poses_bounds.npy -> <scene>/poses_bounds.npy   (symlinks)
   <out>/colmap_<gop_start>/sparse/0   SfM of the GOP's first frame with all cameras, one camera id per view
                                       (as GIFStream's own preprocessing; its appearance embedding is per camera id)
-  <out>/gt/<prefix>NNNN.png           test view, resized exactly like GIFStream's loader (cv2 INTER_LINEAR)
+  <out>/gt/<prefix>NNNN.png           test views (cam-major, sorted), resized exactly like GIFStream's loader
+                                      (cv2 INTER_LINEAR); pass their sorted camera indices as GIFStream's --test_set
 """
 from __future__ import annotations
 
@@ -26,16 +27,16 @@ class Args:
     gop_start: int = 0
     gop_len: int = 50
     data_factor: int = 2
-    test_cam: str = "cam00"
+    test_cams: tuple[str, ...] = ("cam00",)
     gt_prefix: str = "val_step29999_"  # GIFStream names its test renders <stage>_step<step>_<i:04d>.png
     max_image_size: int = 2704
 
 
 def main(a: Args) -> None:
     os.makedirs(a.out_dir, exist_ok=True)
-    for name in ("png", "poses_bounds.npy"):
+    for name in ("png", "poses_bounds.npy"):  # poses_bounds only feeds GIFStream's spiral trajectory
         dst = os.path.join(a.out_dir, name)
-        if not os.path.lexists(dst):
+        if not os.path.lexists(dst) and os.path.exists(os.path.join(a.scene_dir, name)):
             os.symlink(os.path.abspath(os.path.join(a.scene_dir, name)), dst)
 
     sparse = os.path.join(a.out_dir, f"colmap_{a.gop_start}", "sparse", "0")
@@ -51,12 +52,14 @@ def main(a: Args) -> None:
 
     gt_dir = os.path.join(a.out_dir, "gt")
     os.makedirs(gt_dir, exist_ok=True)
-    for i in range(a.gop_len):
-        im = imageio.imread(os.path.join(a.scene_dir, "png", a.test_cam, f"{a.gop_start + i + 1:05d}.png"))[..., :3]
-        im = cv2.resize(im, dsize=(im.shape[1] // a.data_factor, im.shape[0] // a.data_factor),
-                        interpolation=cv2.INTER_LINEAR)
-        imageio.imwrite(os.path.join(gt_dir, f"{a.gt_prefix}{i:04d}.png"), im)
-    print(f"gt: {a.gop_len} images of {a.test_cam} -> {gt_dir}")
+    test_cams = sorted(os.listdir(os.path.join(a.scene_dir, "png"))) if "all" in a.test_cams else sorted(a.test_cams)
+    for k, cam in enumerate(test_cams):
+        for i in range(a.gop_len):
+            im = imageio.imread(os.path.join(a.scene_dir, "png", cam, f"{a.gop_start + i + 1:05d}.png"))[..., :3]
+            im = cv2.resize(im, dsize=(im.shape[1] // a.data_factor, im.shape[0] // a.data_factor),
+                            interpolation=cv2.INTER_LINEAR)
+            imageio.imwrite(os.path.join(gt_dir, f"{a.gt_prefix}{k * a.gop_len + i:04d}.png"), im)
+    print(f"gt: {a.gop_len} images of {test_cams} -> {gt_dir}")
 
 
 if __name__ == "__main__":

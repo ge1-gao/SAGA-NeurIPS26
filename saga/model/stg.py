@@ -42,6 +42,8 @@ def pixel_rays(Ks: torch.Tensor, camtoworlds: torch.Tensor, H: int, W: int) -> t
 
 
 class STGModel(nn.Module):
+    near_plane = 0.01  # set per run from Config.near_plane
+
     def __init__(self, xyz: torch.Tensor, rgb: torch.Tensor, tau: torch.Tensor, motion_degree: int = 3,
                  init_opacity: float = 0.1, lifespan_init: float = 1.0, t_opa_threshold: float = 0.05):
         super().__init__()
@@ -79,7 +81,7 @@ class STGModel(nn.Module):
             means=means, quats=quats, scales=torch.exp(p["scales"]),
             opacities=torch.sigmoid(p["opacities"]) * rbf, colors=feats,
             viewmats=batch["viewmats"], Ks=batch["Ks"], width=W, height=H,
-            packed=False)
+            near_plane=self.near_plane, packed=False)
         rays = pixel_rays(batch["Ks"], batch["camtoworlds"], H, W)
         rgb = self.decoder(img.permute(0, 3, 1, 2), rays).permute(0, 2, 3, 1)
         return rgb, alpha, info

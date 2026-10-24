@@ -13,7 +13,7 @@ from saga.anchors.neighbors import interpolate, knn
 from saga.model.embed import HashGrid, LocalHash, pe_dim, posenc
 from saga.model.temporal import polynomial_motion, polynomial_rotation, temporal_opacity
 
-MLPS = ("fuse_c", "f_fine", "fuse_f", "f_geo", "f_color", "d_res")
+MLPS = ("fuse_c", "f_fine", "fuse_f", "f_geo", "f_color", "d_res", "f_off")
 
 
 @dataclass
@@ -42,6 +42,11 @@ class SAGAConfig:
     lambda_A: float = 0.01
     lambda_res: float = 1e-3
     t_vis_thresh: float = 0.01
+    offset_pred: bool = True  # Gaussian offset = f_off(fine feature) + stored residual (the residual is coded)
+    gauss_mask: bool = False  # learnable per-Gaussian on/off mask (HAC-style), used with the codec
+    lambda_mask: float = 1e-3
+    mask_thresh: float = 0.01  # on iff sigmoid(logit) > this
+    near_plane: float = 0.01
 
 
 def mlp(i: int, h: int, o: int, zero_last: bool = False) -> nn.Sequential:
@@ -65,27 +70,24 @@ class SAGAModel(nn.Module):
         self.register_buffer("fine_parent", t(hier["fine_parent"], torch.long))
         Nc, Nf, K, Fd = len(hier["coarse_center"]), len(hier["fine_parent"]), cfg.k_gauss, cfg.feat_dim
 
-        # Spatial support base: mean 3D distance to the 3 nearest fine anchors with overlapping temporal support.
-        frac_t = 0.9
-        u_f0 = self.coarse_center[self.fine_parent] + t(hier["fine_offset"]) * self.coarse_half0[self.fine_parent]
-        half_t = frac_t * self.coarse_half0[self.fine_parent, 3]
-        nn_idx = knn(u_f0, 16)[:, 1:]
-        d3 = (u_f0[nn_idx, :3] - u_f0[:, None, :3]).norm(dim=-1)
-        overlap = (u_f0[nn_idx, 3] - u_f0[:, None, 3]).abs() < half_t[nn_idx] + half_t[:, None]
-        k = min(3, d3.shape[1])
-        d_ov = d3.masked_fill(~overlap, float("inf")).topk(k, largest=False).values
-        d_ov = torch.where(torch.isfinite(d_ov), d_ov, d3.topk(k, largest=False).values)
-        self.register_buffer("fine_spacing", d_ov.mean(1, keepdim=True).clamp_min(1e-4))
-
         feat = torch.zeros(Nc, Fd, device=device)
         feat[:, :3] = t(coarse_rgb)
         self.coarse_feat = nn.Parameter(feat)
         self.coarse_half_delta = nn.Parameter(torch.zeros(Nc, 4, device=device))
         self.fine_offset = nn.Parameter(t(hier["fine_offset"]))
+        frac_t = 0.9
+        self.register_buffer("fine_spacing", torch.empty(Nf, 1, device=device))
+        self.update_spacing(frac_t)
         g = torch.empty(Nf, K, 4, device=device)
         g[..., :3].normal_(0, 0.3)
         g[..., 3].uniform_(-1, 1)
+        if cfg.offset_pred:  # the last bias holds the random layout as a shared template; residuals start at 0
+            self.f_off = mlp(Fd, cfg.hidden, K * 4, zero_last=True)
+            self.f_off[-1].bias.data.copy_(g[0].flatten())
+            g = torch.zeros_like(g)
         self.gauss_offset = nn.Parameter(g)
+        if cfg.gauss_mask:
+            self.gauss_mask = nn.Parameter(torch.full((Nf, K), 2.0, device=device))  # logits, start "on"
 
         H, po, pp = cfg.hidden, pe_dim(4, cfg.pe_off), pe_dim(4, cfg.pe_pos)
         self.fuse_c = mlp(Fd + pp, H, Fd)
@@ -119,6 +121,28 @@ class SAGAModel(nn.Module):
         self.coarse_cand = knn(self.coarse_center, cfg.knn_cand)
         self.fine_cand = None
         self.res = None
+        self._decoded = None  # inference cache: decode() is time-invariant
+
+    def mask(self) -> torch.Tensor:
+        """[Nf, K] hard 0/1 mask with a straight-through sigmoid gradient."""
+        s = torch.sigmoid(self.gauss_mask)
+        return (s > self.cfg.mask_thresh).float() + s - s.detach()
+
+    @torch.no_grad()
+    def update_spacing(self, frac_t: float = 0.9):
+        """Spatial support base: mean 3D distance to the 3 nearest fine anchors with overlapping temporal support.
+
+        Computed from the initial (box) coarse half-sizes and the current fine offsets, so a decoder can recompute it.
+        """
+        u_f0 = self.coarse_center[self.fine_parent] + self.fine_offset * self.coarse_half0[self.fine_parent]
+        half_t = frac_t * self.coarse_half0[self.fine_parent, 3]
+        nn_idx = knn(u_f0, 16)[:, 1:]
+        d3 = (u_f0[nn_idx, :3] - u_f0[:, None, :3]).norm(dim=-1)
+        overlap = (u_f0[nn_idx, 3] - u_f0[:, None, 3]).abs() < half_t[nn_idx] + half_t[:, None]
+        k = min(3, d3.shape[1])
+        d_ov = d3.masked_fill(~overlap, float("inf")).topk(k, largest=False).values
+        d_ov = torch.where(torch.isfinite(d_ov), d_ov, d3.topk(k, largest=False).values)
+        self.fine_spacing = d_ov.mean(1, keepdim=True).clamp_min(1e-4)
 
     @property
     def coarse_half(self):
@@ -154,7 +178,10 @@ class SAGAModel(nn.Module):
         u_f, l_f, f_f = self.decode_fine()
         Nf, K = self.gauss_offset.shape[:2]
         owner = torch.arange(Nf, device=u_f.device).repeat_interleave(K)
-        o = self.gauss_offset.reshape(-1, 4)
+        o = self.gauss_offset
+        if cfg.offset_pred:
+            o = o + self.f_off(f_f).view(Nf, K, 4)
+        o = o.reshape(-1, 4)
         u_g = u_f[owner] + o * l_f[owner]
         if self.fine_cand is None:
             self.refresh_knn(u_f)
@@ -183,6 +210,7 @@ class SAGAModel(nn.Module):
             "motion": mo * self.box_scale,
             "omega": om,
             "feat": feat, "pe_o": pe_o, "color_res": r_col,
+            "mask": self.mask().reshape(-1) if cfg.gauss_mask else None,
         }
 
     @torch.no_grad()
@@ -191,10 +219,24 @@ class SAGAModel(nn.Module):
             u_f = self.decode_fine()[0]
         self.fine_cand = knn(u_f.detach(), self.cfg.knn_cand)
 
+    def forward(self, batch: dict, H: int, W: int):
+        """= render; lets torch.func.functional_call render with quantized parameters."""
+        return self.render(batch, H, W)
+
     def render(self, batch: dict, H: int, W: int):
-        g = self.decode()
+        if torch.is_grad_enabled():  # training: parameters change every step
+            self._decoded = None
+            g = self.decode()
+        else:  # inference: decode once, reuse for every frame and view
+            if self._decoded is None:
+                self._decoded = self.decode()
+            g = self._decoded
         rbf, dt = temporal_opacity(batch["tau"], g["tau"], g["log_tscale"])
-        idx = (rbf > self.cfg.t_vis_thresh).nonzero().squeeze(-1)
+        vis = rbf > self.cfg.t_vis_thresh
+        if g["mask"] is not None and not torch.is_grad_enabled():  # inference: drop masked Gaussians
+            vis = vis & (g["mask"] > 0.5)
+        idx = vis.nonzero().squeeze(-1)
+        opa = g["opacity"] * g["mask"] if g["mask"] is not None else g["opacity"]
         means = polynomial_motion(g["means"][idx], g["motion"][idx], dt[idx])
         quats = polynomial_rotation(g["quats"][idx], g["omega"][idx], dt[idx])
         cam_pos = batch["camtoworlds"][:, :3, 3]
@@ -205,8 +247,9 @@ class SAGAModel(nn.Module):
         if g["color_res"] is not None:
             col = col + g["color_res"][idx][None]
         return rasterization(
-            means=means, quats=quats, scales=g["scales"][idx], opacities=g["opacity"][idx] * rbf[idx],
-            colors=torch.sigmoid(col), viewmats=batch["viewmats"], Ks=batch["Ks"], width=W, height=H)
+            means=means, quats=quats, scales=g["scales"][idx], opacities=opa[idx] * rbf[idx],
+            colors=torch.sigmoid(col), viewmats=batch["viewmats"], Ks=batch["Ks"], width=W, height=H,
+            near_plane=self.cfg.near_plane)
 
     def regularization(self) -> torch.Tensor:
         cfg = self.cfg
@@ -214,6 +257,8 @@ class SAGAModel(nn.Module):
         loss = cfg.lambda_A * (F.relu(offs.abs() - cfg.rho_A) ** 2).sum(-1).mean()
         if cfg.use_hash and self.res is not None:
             loss = loss + cfg.lambda_res * self.res.abs().mean()
+        if cfg.gauss_mask:
+            loss = loss + cfg.lambda_mask * self.mask().mean()
         return loss
 
     def param_groups(self) -> list[dict]:
@@ -226,6 +271,8 @@ class SAGAModel(nn.Module):
             {"name": "mlp", "params": mlps, "lr": 4e-3, "lr_final": 4e-5},
             {"name": "gauss_offset", "params": [self.gauss_offset], "lr": 1e-2, "lr_final": 1e-4},
         ]
+        if self.cfg.gauss_mask:
+            groups.append({"name": "gauss_mask", "params": [self.gauss_mask], "lr": 1e-2, "lr_final": 1e-3})
         if self.cfg.use_hash:
             groups.append({"name": "hash", "params": [self.hash.table], "lr": 5e-3, "lr_final": 5e-5})
         return groups

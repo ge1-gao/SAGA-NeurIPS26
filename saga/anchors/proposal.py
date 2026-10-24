@@ -22,7 +22,10 @@ class ProposalConfig:
     alpha_min: float = 0.005
     gamma: float = 1.0
     static_motion: float = 0.01  # static = moves < this × box scale within its own visible window
+    static_min_half: float = 0.25  # ... and is visible for long: half window dt ≥ this (GOP units)
     w_cap: float = 10.0
+    screen_density: bool = True  # weight × median(d) / d, d = distance to the nearest training camera:
+    # ∝ projected size per unit world length, so anchors follow pixel footprint (near content gets more)
 
 
 def load_stg(path: str, device: str = "cuda") -> STGModel:
@@ -73,7 +76,7 @@ def select(model: STGModel, scores: dict, cfg: ProposalConfig) -> torch.Tensor:
 
 @torch.no_grad()
 def to_candidates(model: STGModel, scores: dict, keep: torch.Tensor, box_center: np.ndarray, box_scale: float,
-                  cfg: ProposalConfig) -> dict:
+                  cfg: ProposalConfig, cam_pos: torch.Tensor) -> dict:
     p = model.params
     qs, qd = scores["thresholds"]
     xyz = p["means"][keep]
@@ -81,10 +84,44 @@ def to_candidates(model: STGModel, scores: dict, keep: torch.Tensor, box_center:
     dt = (2 * torch.exp(p["trbf_scale"][keep])).clamp(max=0.5)
     disp = torch.maximum((polynomial_motion(xyz, p["motion"][keep], dt) - xyz).norm(dim=-1),
                          (polynomial_motion(xyz, p["motion"][keep], -dt) - xyz).norm(dim=-1))
-    static = disp < cfg.static_motion * box_scale
+    static = (disp < cfg.static_motion * box_scale) & (dt.squeeze(-1) >= cfg.static_min_half)
     tau = torch.where(static, torch.full_like(tau, 0.5), tau)
-    w = torch.maximum(scores["S"][keep] / max(qs, 1e-12), scores["D"][keep] / max(qd, 1e-12)).clamp(max=cfg.w_cap)
+    w = torch.maximum(scores["S"][keep] / max(qs, 1e-12), scores["D"][keep] / max(qd, 1e-12))
+    if cfg.screen_density:
+        d = torch.cdist(xyz, cam_pos.to(xyz)).min(1).values
+        w = w * d.median() / d.clamp_min(1e-6)
+    w = w.clamp(max=cfg.w_cap)
     x = ((xyz - torch.as_tensor(box_center, device=xyz.device, dtype=xyz.dtype)) / box_scale).clamp(-1 + 1e-4, 1 - 1e-4)
     return {"x": x.cpu().numpy().astype(np.float32), "tau": tau.cpu().numpy().astype(np.float32),
             "h": torch.sigmoid(p["colors"][keep]).cpu().numpy().astype(np.float32),
             "w": w.cpu().numpy().astype(np.float32), "static": static.cpu().numpy()}
+
+
+class GOPView:
+    """Frames [start, start+length) of a longer sequence, with GOP-local τ, for scoring that GOP's STG warm-up."""
+
+    def __init__(self, data, start: int, length: int):
+        self.data, self.start, self.length, self.train_idx = data, start, length, data.train_idx
+        self.height, self.width = data.height, data.width
+
+    def batch(self, cam_idx: torch.Tensor, t: int) -> dict:
+        b = self.data.batch(cam_idx, self.start + t)
+        b["tau"] = t / self.length
+        return b
+
+
+def merge_gops(parts: list[tuple[int, dict]], gop_len: int, seq_len: int, cell: float = 2 / 1024) -> dict:
+    """Candidates of consecutive GOPs -> one sequence. parts: (GOP start frame within the sequence, candidates).
+
+    Dynamic τ is mapped to sequence time; static candidates (τ = 0.5 already) recur in every GOP, so per cell of
+    side `cell` (box units) only the heaviest static one is kept.
+    """
+    c = {k: np.concatenate([p[k] for _, p in parts]) for k in parts[0][1]}
+    g = np.concatenate([np.full(len(p["x"]), s) for s, p in parts])
+    c["tau"] = np.where(c["static"], 0.5, (g + c["tau"] * gop_len) / seq_len).astype(np.float32)
+    st = np.flatnonzero(c["static"])
+    key = np.floor((c["x"][st] + 1) / cell).astype(np.int64)
+    order = np.argsort(-c["w"][st], kind="stable")
+    _, first = np.unique(key[order], axis=0, return_index=True)
+    keep = np.concatenate([np.flatnonzero(~c["static"]), st[order[first]]])
+    return {k: v[keep] for k, v in c.items()}

@@ -34,6 +34,7 @@ def triangulate_frame(scene_dir: str, frame: int, test_cams, max_image_size: int
     db_path = os.path.join(work, "db.db")
 
     c0 = cams[names[0]]
+    per_image_cameras = per_image_cameras or any(not np.allclose(cams[n].K, c0.K) for n in names)
     reader = pycolmap.ImageReaderOptions()
     reader.camera_model = "PINHOLE"
     reader.camera_params = ",".join(str(v) for v in (c0.K[0, 0], c0.K[1, 1], c0.K[0, 2], c0.K[1, 2]))
@@ -43,6 +44,15 @@ def triangulate_frame(scene_dir: str, frame: int, test_cams, max_image_size: int
                               camera_mode=pycolmap.CameraMode.PER_IMAGE if per_image_cameras else pycolmap.CameraMode.SINGLE,
                               camera_model="PINHOLE", reader_options=reader,
                               sift_options=sift)
+    if per_image_cameras:  # the reader seeded every camera with the first view's K; set each view's own before matching
+        db = pycolmap.Database()
+        db.open(db_path)
+        cam_name = {im.camera_id: os.path.splitext(im.name)[0] for im in db.read_all_images()}
+        for cam in db.read_all_cameras():
+            K = cams[cam_name[cam.camera_id]].K
+            cam.params = np.array([K[0, 0], K[1, 1], K[0, 2], K[1, 2]])
+            db.update_camera(cam)
+        db.close()
     pycolmap.match_exhaustive(db_path)
 
     rec = pycolmap.Reconstruction()

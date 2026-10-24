@@ -38,9 +38,13 @@ def main(a: Args) -> None:
             dst = os.path.join(a.out_dir, "images", stem + ".png")
             if not os.path.lexists(dst):
                 os.symlink(os.path.abspath(os.path.join(a.scene_dir, "png", n, f"{a.gop_start + t + 1:05d}.png")), dst)
-            splits["test" if n in a.test_cams else "train"].append({
-                "file_path": f"images/{stem}", "time": t / a.fps, "transform_matrix": c2w.tolist(),
-                "fl_x": c.K[0, 0], "fl_y": c.K[1, 1], "cx": c.K[0, 2], "cy": c.K[1, 2], "w": c.width, "h": c.height})
+            frame = {"file_path": f"images/{stem}", "time": t / a.fps, "transform_matrix": c2w.tolist(),
+                     "fl_x": c.K[0, 0], "fl_y": c.K[1, 1], "cx": c.K[0, 2], "cy": c.K[1, 2], "w": c.width, "h": c.height}
+            if "all" in a.test_cams:  # MIV CTC: every source view is trained on and evaluated
+                splits["train"].append(frame)
+                splits["test"].append(frame)
+            else:
+                splits["test" if n in a.test_cams else "train"].append(frame)
     for k, frames in splits.items():
         with open(os.path.join(a.out_dir, f"transforms_{k}.json"), "w") as f:
             json.dump({"frames": frames}, f)

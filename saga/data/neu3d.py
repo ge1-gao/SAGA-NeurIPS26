@@ -72,8 +72,11 @@ class Neu3DGOP:
         all_cams = read_cameras(os.path.join(scene_dir, "colmap_0", "manual"))
         names = sorted(n for n in all_cams if os.path.isdir(os.path.join(scene_dir, "png", n)))
         self.cams = [all_cams[n] for n in names]
-        self.test_idx = [i for i, c in enumerate(self.cams) if c.name in test_cams]
-        self.train_idx = [i for i, c in enumerate(self.cams) if c.name not in test_cams]
+        if "all" in test_cams:  # MIV CTC: every source view is coded and evaluated
+            self.test_idx = self.train_idx = list(range(len(self.cams)))
+        else:
+            self.test_idx = [i for i, c in enumerate(self.cams) if c.name in test_cams]
+            self.train_idx = [i for i, c in enumerate(self.cams) if c.name not in test_cams]
         assert self.test_idx and self.train_idx
 
         c0 = self.cams[0]
